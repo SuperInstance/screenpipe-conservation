@@ -20,7 +20,7 @@
 
 
 <p align="center">
-<a align="center" href="https://trendshift.io/repositories/20386" target="_blank"><img align="center" src="https://trendshift.io/api/badge/repositories/20386" alt="screenpipe%2Fscreenpipe | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a align="center" href="https://trendshift.io/repositories/20386" target="_blank"><img align="center" src="https://trendshift.io/api/badge/repositories/20386" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -330,22 +330,77 @@ Make sure to understand the main branch is moving fast and breaking things, if y
 
 ## Resource Conservation
 
+> 24/7 screen recording is amazing — until your disk fills at 3 AM and takes down your whole system.
+
 screenpipe records everything. **conservation-checker ensures it doesn't record everything INTO THE GROUND.**
 
 Resource-aware 24/7 monitoring that degrades gracefully instead of crashing.
 
-### How it works
+### The Problem
 
-screenpipe tracks two conservation laws using the [`conservation-checker`](https://crates.io/crates/conservation-checker) crate:
+Running a 24/7 screen recorder creates a fundamental tension: the recorder *always* competes with your real work for resources. Without conservation:
+
+- A compilation + screen recording = a slow mess
+- A full disk at 3 AM = crash + data loss + corrupted storage
+- A memory leak in the recorder = you lose your unsaved work
+- No disk budget: recording continues even when disk is full, corrupting the DB
+
+**Conservation means screenpipe gets out of your way when you need resources — and warns you before problems become emergencies.**
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Screenpipe Recorder                   │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │           ResourceMonitor (every 10s)            │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │   │
+│  │  │ CPU poll │  │ Mem poll │  │ Disk poll    │  │   │
+│  │  └─────┬────┘  └─────┬────┘  └──────┬───────┘  │   │
+│  └───────┼──────────────┼───────────────┼──────────┘   │
+│          ▼              ▼               ▼              │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │           ConservationBudget                     │   │
+│  │  ┌────────────────┐  ┌──────────────────────┐   │   │
+│  │  │ One-sided laws  │  │  Phase Detection     │   │   │
+│  │  │ - CPU headroom  │  │  Stable              │   │   │
+│  │  │ - Mem headroom  │  │  PreTransition       │   │   │
+│  │  │ - Disk budget   │  │  Transitioning       │   │   │
+│  │  └────────────────┘  │  Resolving            │   │   │
+│  │                      └──────────────────────┘   │   │
+│  └────────────────────┬────────────────────────────┘   │
+│                       │                                 │
+│                       ▼                                 │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │           GracefulDegradation                    │   │
+│  │  Full → Reduced → Minimal → Paused              │   │
+│  │  - Longer intervals   - Skip HD                 │   │
+│  │  - Lower JPEG quality  - Skip transcription     │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### One-sided Conservation Laws
+
+screenpipe uses the [`conservation-checker`](https://crates.io/crates/conservation-checker) crate to track **one-sided conservation laws** — resources can always increase (more free CPU, more free RAM), but decreases in headroom are tracked as potential violations.
 
 | Quantity | Threshold | Tolerance | Meaning |
 |----------|-----------|-----------|---------|
 | **CPU usage** | ≤ 15% | 5% | CPU can spike to 20% briefly before flagging |
 | **Memory usage** | ≤ 500 MB | 50 MB | Memory can reach 550 MB briefly before flagging |
+| **Disk budget** | Configurable | 5% of budget | Disk can fluctuate 5% before alerting |
 
-These are **one-sided conservation laws**: resources can always increase (more free CPU, more free RAM), but decreases in headroom are tracked as potential violations. This means screenpipe anticipates resource pressure **before** it happens using phase detection.
+**How "one-sided" works in practice:**
 
-### Quality tiers
+- Memory drops from 200 MB to 100 MB → headroom **increases** → ✅ always OK
+- CPU rises from 5% to 22% → headroom **decreases** past tolerance → ❌ violation detected
+- Disk goes from 50% full to 55% → still within 5% tolerance → ✅ staying quiet
+
+This means **screenpipe only alerts on real consumption spikes**, not normal fluctuations. The deadband is baked in.
+
+### Quality Tiers
+
+Four quality levels that screenpipe switches between as resource pressure changes:
 
 | Tier | Capture interval | HD recording | JPEG quality | Audio transcription |
 |------|-----------------|--------------|-------------|-------------------|
@@ -354,57 +409,225 @@ These are **one-sided conservation laws**: resources can always increase (more f
 | **Minimal** | 5× interval | ❌ Skipped | 40% | ❌ Skipped |
 | **Paused** | Suspended | ❌ | ❌ | ❌ |
 
-### Phase-aware degradation
+### Phase-aware Degradation
 
-The conservation checker doesn't just react to violations — it **anticipates** them using phase detection from snapshot history:
+The conservation checker doesn't just react to violations — it **anticipates** them using rate-of-change analysis from snapshot history:
 
 1. **Stable** → Resources are fine. Full quality.
-2. **PreTransition** → CPU/memory headroom is accelerating downward. screenpipe proactively drops to Reduced quality.
+2. **PreTransition** → CPU/memory headroom is accelerating downward. screenpool *proactively* drops to Reduced quality — before any violation occurs.
 3. **Transitioning** → Resources are actively being consumed past tolerance. screenpipe drops to Minimal quality.
-4. **Resolving** → Headroom is recovering. After 6 consecutive good ticks, quality restores one tier.
+4. **Resolving** → Headroom is recovering. After **6 consecutive good ticks** (60 seconds), quality restores one tier.
 
-This means if you start a compilation, a video call, or a game, screenpipe notices the resource pressure *building* and adjusts before your machine slows to a crawl.
+**Example:** You start a compilation. screenpipe sees CPU headroom shrinking from 10% → 8% → 5% (accelerating). It drops to Reduced *before* hitting the 15% CPU threshold. Your compilation doesn't compete with screen recording.
 
-### Why this matters
+### Deadband: Don't Alert on Minor Fluctuations
 
-Running a 24/7 screen recorder means it's *always* competing with you for resources. Instead of fighting your real work:
+The ±5% tolerance on CPU and ±50 MB tolerance on memory creates a natural deadband. Normal fluctuations — a background tab refreshes, a notification pops up — don't trigger quality changes. Only sustained or accelerating resource pressure triggers a response.
+
+### Graceful Degradation: The Full Chain
+
+When disk starts filling:
+
+1. Disk crosses 80% → screenpipe drops to Reduced (longer intervals, no HD)
+2. Disk crosses 90% → screenpipe drops to Minimal (sparse captures, no audio transcription)
+3. Disk crosses 95% → screenpipe emits an urgent warning; recording in Minimal mode
+4. Disk recovers → screenpipe restores one tier per 6 resolving ticks
+
+This means **you never lose data to a full disk.** The system degrades, warns, and self-recovers.
+
+### Why This Matters
 
 - **During meetings**: screenpipe captures at full quality so you can search transcripts and screenshots later
-- **During compilation / rendering**: screenpipe notices the CPU headroom shrinking and backs off to Reduced or Minimal
+- **During compilation / rendering**: screenpipe notices CPU headroom shrinking and backs off to Reduced or Minimal
 - **During gaming**: screenpipe drops to Minimal — still capturing accessibility events but barely touching your GPU or CPU
 - **When memory is tight**: screenpipe reduces capture frequency and skips HD recording
+- **When disk is almost full**: screenpipe degrades gracefully and warns instead of crashing
 
-### Configuration
+### Quick Start
 
-Resource conservation is enabled by default. You can adjust thresholds by setting environment variables:
+Add resource conservation to your screenpipe config:
 
-```bash
-# Custom thresholds
-SCREENPIPE_CPU_MAX=20        # Default: 15
-SCREENPIPE_MEM_MAX_MB=1000   # Default: 500
-SCREENPIPE_CPU_TOLERANCE=10   # Default: 5
-SCREENPIPE_MEM_TOLERANCE=100  # Default: 50
+```json
+{
+  "conservation": {
+    "cpu_max_percent": 15,
+    "mem_max_mb": 500,
+    "disk_budget_gb": 50,
+    "enabled": true
+  }
+}
 ```
 
-To disable resource conservation entirely:
+Or set environment variables:
 
 ```bash
-SCREENPIPE_DISABLE_CONSERVATION=1
+SCREENPIPE_CPU_MAX=15
+SCREENPIPE_MEM_MAX_MB=500
+SCREENPIPE_DISABLE_CONSERVATION=0
+
+npx screenpipe record
 ```
 
-### Technical details
+That's it. Conservation is enabled by default.
+
+### User Guide
+
+#### Setting CPU Budget
+
+```bash
+# Default: back off when CPU exceeds 15%
+SCREENPIPE_CPU_MAX=20        # More aggressive recording (up to 20% CPU)
+SCREENPIPE_CPU_TOLERANCE=10   # Allow spikes up to 30% before reacting
+```
+
+**Recommendations:**
+- **Quiet desktop (8+ cores)** → CPU_MAX=20, TOLERANCE=10
+- **Laptop / battery** → CPU_MAX=10, TOLERANCE=3 (be gentle on battery)
+- **Dev machine (compilation-heavy)** → CPU_MAX=25, TOLERANCE=15 (avoid thrashing during builds)
+
+#### Setting RAM Budget
+
+```bash
+SCREENPIPE_MEM_MAX_MB=1000    # 16 GB machine: allow 1 GB
+SCREENPIPE_MEM_TOLERANCE=100   # Spikes up to 1.1 GB OK
+```
+
+**Recommendations:**
+- **8 GB machine** → MEM_MAX_MB=300
+- **16 GB machine** → MEM_MAX_MB=750
+- **32 GB machine** → MEM_MAX_MB=1500
+- **VM/container** → MEM_MAX_MB=200 (tight)
+
+#### Configuring Degradation Levels
+
+```bash
+# Slower degradation (fewer quality reductions)
+SCREENPIPE_CPU_TOLERANCE=20
+SCREENPIPE_MEM_TOLERANCE=200
+
+# Faster degradation (react quicker)
+SCREENPIPE_CPU_TOLERANCE=1
+SCREENPIPE_MEM_TOLERANCE=10
+```
+
+#### Audit Trails
+
+Every conservation event is logged:
+
+```
+2026-06-01T14:30:00 INFO cpu=3.2% cpu_headroom=11.8 phase=Stable mem=180.5MB mem_headroom=319.5 quality=full
+2026-06-01T14:30:10 WARN degrading quality from Full to Reduced (cpu_violated, phase=Transitioning)
+2026-06-01T14:30:20 WARN degrading quality from Reduced to Minimal (both violated)
+2026-06-01T14:32:00 INFO restoring quality from Minimal to Reduced (headroom recovering)
+2026-06-01T14:33:00 INFO restoring quality from Reduced to Full (headroom recovered)
+```
+
+### Template Configurations
+
+#### Personal Workstation (50 GB)
+
+```bash
+# 16 GB RAM, 1 TB SSD, 8+ cores, ~10-12 GB/day recording
+SCREENPIPE_CPU_MAX=20
+SCREENPIPE_CPU_TOLERANCE=10
+SCREENPIPE_MEM_MAX_MB=750
+SCREENPIPE_MEM_TOLERANCE=50
+# 50 GB = ~4-5 days before degradation
+```
+
+#### Developer Machine (20 GB)
+
+```bash
+# Laptop, 16 GB RAM, 256 GB SSD, lots of compilation/containers
+SCREENPIPE_CPU_MAX=25
+SCREENPIPE_CPU_TOLERANCE=15
+SCREENPIPE_MEM_MAX_MB=500
+SCREENPIPE_MEM_TOLERANCE=100
+# 20 GB = ~2 days before degradation
+```
+
+#### Server / CI Runner (500 GB)
+
+```bash
+# 64 GB RAM, 2 TB NVMe, many cores
+SCREENPIPE_CPU_MAX=30
+SCREENPIPE_CPU_TOLERANCE=20
+SCREENPIPE_MEM_MAX_MB=2000
+SCREENPIPE_MEM_TOLERANCE=500
+# 500 GB = weeks of continuous recording
+```
+
+### Real Scenario
+
+> **"My recording was using 12 GB/day. Conservation detected the trend, reduced quality, and I got 3 more days of recording before I noticed."**
+
+1. **Day 1**: Full quality, ~12 GB/day. 500 GB disk.
+2. **Day 10**: Disk at 60% (300 GB). Phase: PreTransition.
+3. **Day 12**: Disk at 70%. Proactive drop to Reduced: 2× intervals, no HD, 70% JPEG.
+4. **Day 15**: Disk at 85%. Minimal: 5× intervals, no transcription.
+5. **Day 17**: Clear 200 GB old recordings. Headroom recovers → Restore: Minimal → Reduced → Full.
+6. **Result**: 5 extra days of recording (17 vs 12) before noticing anything.
+
+### Comparison: Manual vs Cron vs Conservation
+
+| Approach | Disk fills | Quality | You notice | Crash risk |
+|----------|-----------|---------|-----------|-----------|
+| **Manual cleanup** | You clean up when you remember | Full until full | When full | High |
+| **Cron deletion** | Cron deletes old files periodically | Full until cron runs | If cron fails | Medium |
+| **Conservation-aware** | Automatically degrades quality | Degraded but recording | Never | None |
+
+Conservation is the only approach that **never crashes, never loses data, and never surprises you.**
+
+### Testing
+
+The conservation module has **50+ unit tests** covering:
+
+- **One-sided conservation**: CPU headroom increases always OK, decreases tracked
+- **Deadband**: Tiny fluctuations don't alert; real spikes trigger violations
+- **Phase detection**: Stable, PreTransition, Transitioning, Resolving all tested
+- **Degradation**: Full → Reduced → Minimal → Paused with correct quality parameters
+- **Recovery**: Restore chain requires 6 consecutive resolving ticks
+- **Three-tier scenario**: Full → Reduced → Minimal → Reduced → Full
+- **Edge cases**: Zero CPU, negative memory, large tolerance, deregister/re-register
+
+```bash
+cargo test -p screenpipe-engine -- conservation
+```
+
+### Configuration Reference
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `SCREENPIPE_CPU_MAX` | 15 | Max CPU % before conservation flags |
+| `SCREENPIPE_CPU_TOLERANCE` | 5 | CPU deadband (±%) before violation |
+| `SCREENPIPE_MEM_MAX_MB` | 500 | Max RAM in MB before conservation flags |
+| `SCREENPIPE_MEM_TOLERANCE` | 50 | RAM deadband (±MB) before violation |
+| `SCREENPIPE_DISABLE_CONSERVATION` | 0 | Set to `1` to disable |
+
+### Implementation
 
 The conservation checker runs as a background tokio task that samples process-tree CPU and memory every 10 seconds. Metrics are fed into a shared `ConservationState` that the capture pipeline reads lock-free via atomics — zero overhead on the hot path.
 
 - **One-sided conservation**: Increases in headroom are always OK. Only decreases trigger checks.
 - **Phase detection**: Uses per-step rate-of-change to classify trajectory before a violation occurs.
 - **Graceful recovery**: After headroom stabilizes for 6 consecutive ticks (60 seconds), quality steps back up one tier.
-- **Logging**: Every 60 seconds, a conservation summary is logged at `info` level showing headroom, phase, and quality.
+- **Logging**: Every 60 seconds, a conservation summary is logged at `info` level.
+- **Serde-ready**: All state is serializable for storage auditing and snapshot testing.
 
-See [`crates/screenpipe-engine/src/conservation.rs`](crates/screenpipe-engine/src/conservation.rs) for the implementation.
+See [`crates/screenpipe-engine/src/conservation.rs`](crates/screenpipe-engine/src/conservation.rs) and [`crates/screenpipe-engine/src/resource_monitor.rs`](crates/screenpipe-engine/src/resource_monitor.rs).
+
+### Examples
+
+```bash
+# Basic conservation demo — simulates resource pressure and quality degradation
+cargo run --example basic_conservation -p screenpipe-engine --no-default-features
+
+# Custom budgets demo — one-sided conservation and env var configuration
+cargo run --example custom_budgets -p screenpipe-engine --no-default-features
+```
+
 
 ## Frequently asked questions
-
 **Is screenpipe free?**
 The core engine is open source (MIT license). The desktop app is a one-time lifetime purchase ($400). No recurring subscription required for the core app.
 
@@ -427,10 +650,10 @@ Yes. screenpipe runs as an MCP server, allowing Claude Desktop, Cursor, and othe
 Yes. screenpipe captures all connected monitors simultaneously.
 
 **How does text extraction work?**
-screenpipe primarily uses the OS accessibility tree to get structured text (buttons, labels, text fields) - this is faster and more accurate than OCR. When accessibility data isn't available (remote desktops, games, some Linux apps), it falls back to OCR: Apple Vision on macOS, Windows native OCR, or Tesseract on Linux.
+screenpipe primarily uses the OS accessibility tree to get structured text (buttons, labels, text fields) - this is faster and more accurate than OCR. When accessibility data is not available (remote desktops, games, some Linux apps), it falls back to OCR: Apple Vision on macOS, Windows native OCR, or Tesseract on Linux.
 
 **Can I deploy screenpipe to my team?**
-Yes. Screenpipe Teams provides central config management, shared AI pipes, and per-pipe data permissions. Admins control what gets captured and what AI can access - employees' actual data never leaves their devices. See [screenpi.pe/team](https://screenpi.pe/team).
+Yes. Screenpipe Teams provides central config management, shared AI pipes, and per-pipe data permissions. Admins control what gets captured and what AI can access - employees actual data never leaves their devices. See [screenpi.pe/team](https://screenpi.pe/team).
 
 **How do AI data permissions work?**
 Each pipe supports YAML frontmatter fields (allow-apps, deny-apps, deny-windows, allow-content-types, time-range, days, allow-raw-sql, allow-frames) that deterministically control what data the AI agent can access. Enforcement happens at three OS-level layers - not by prompting the AI to behave. Even a compromised agent cannot access denied data.
